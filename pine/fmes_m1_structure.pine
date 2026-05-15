@@ -1,0 +1,128 @@
+//@version=6
+// =====================================================================
+// FMES / HTF Mystery — Module 1: Structure & Break of Structure
+// Based on Marcell / Flipping Markets blueprint
+//
+// Detects:
+//   - Swing highs / lows (pivots)
+//   - Break of Structure (BOS) — body close past most recent unbroken swing
+//   - Wick sweeps — high/low pierces a swing but body closes back inside
+//
+// Intentionally NOT in M1:
+//   - "Protected" vs unprotected status (M2)
+//   - Volume gap confirmation (M2)
+//   - Order Block (M3), Fibonacci (M3), LQ+ patterns (M4)
+// =====================================================================
+
+indicator("FMES M1 — Structure & BOS", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=100)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+grpStruct = "Structure"
+pivotLen  = input.int(5, "Pivot lookback (bars left & right)",
+     minval=1, maxval=50, group=grpStruct,
+     tooltip="How many bars on each side define a swing. 5 = strict, 2-3 = aggressive.")
+
+grpDisp = "Display"
+showPivots = input.bool(true, "Mark swing pivots (H / L)",         group=grpDisp)
+showBOS    = input.bool(true, "Draw BOS lines + labels",            group=grpDisp)
+showSweeps = input.bool(true, "Show wick sweeps (↑ / ↓)",           group=grpDisp)
+extendBOS  = input.bool(true, "Extend BOS line to break candle",    group=grpDisp)
+
+grpColor = "Colors"
+bullColor  = input.color(#26a69a, "Bullish (BOS up / pivot H)",   group=grpColor)
+bearColor  = input.color(#ef5350, "Bearish (BOS down / pivot L)", group=grpColor)
+sweepColor = input.color(#ffa726, "Wick sweep",                    group=grpColor)
+
+// ─── Pivot detection ─────────────────────────────────────────────────
+// ta.pivothigh / ta.pivotlow return the pivot price `pivotLen` bars ago,
+// confirmed only after `pivotLen` bars to the right have closed.
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+// ─── State: most recent unbroken swing high & low ────────────────────
+var float lastHigh    = na
+var int   lastHighBar = na
+var bool  bosFiredUp  = false      // already fired BOS for this swing?
+
+var float lastLow    = na
+var int   lastLowBar = na
+var bool  bosFiredDn = false
+
+// When a new pivot confirms, register it as the active swing and reset
+// the BOS-fired flag so the next break can fire again.
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - pivotLen
+    bosFiredUp  := false
+    if showPivots
+        label.new(lastHighBar, ph, "H",
+             style=label.style_label_down, yloc=yloc.abovebar,
+             color=color.new(bullColor, 70), textcolor=color.white,
+             size=size.tiny)
+
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - pivotLen
+    bosFiredDn := false
+    if showPivots
+        label.new(lastLowBar, pl, "L",
+             style=label.style_label_up, yloc=yloc.belowbar,
+             color=color.new(bearColor, 70), textcolor=color.white,
+             size=size.tiny)
+
+// ─── BOS detection (body close, not wick) ────────────────────────────
+// Bullish BOS: close > most recent unbroken swing high
+bullBOS = not na(lastHigh) and close > lastHigh and not bosFiredUp
+if bullBOS
+    if showBOS
+        x2 = extendBOS ? bar_index : lastHighBar + pivotLen + 1
+        line.new(lastHighBar, lastHigh, x2, lastHigh,
+             color=bullColor, style=line.style_solid, width=2)
+        label.new(bar_index, lastHigh, "BOS ↑",
+             style=label.style_label_down, color=bullColor,
+             textcolor=color.white, size=size.small)
+    bosFiredUp := true
+
+// Bearish BOS: close < most recent unbroken swing low
+bearBOS = not na(lastLow) and close < lastLow and not bosFiredDn
+if bearBOS
+    if showBOS
+        x2 = extendBOS ? bar_index : lastLowBar + pivotLen + 1
+        line.new(lastLowBar, lastLow, x2, lastLow,
+             color=bearColor, style=line.style_solid, width=2)
+        label.new(bar_index, lastLow, "BOS ↓",
+             style=label.style_label_up, color=bearColor,
+             textcolor=color.white, size=size.small)
+    bosFiredDn := true
+
+// ─── Wick sweep detection ────────────────────────────────────────────
+// Sweep ↑ : high pierced a swing high but close stayed at/below it.
+// Sweep ↓ : low pierced a swing low but close stayed at/above it.
+// (Body-close above/below would have been a BOS, handled above.)
+sweepUp = showSweeps and not na(lastHigh) and high > lastHigh and close <= lastHigh
+sweepDn = showSweeps and not na(lastLow)  and low  < lastLow  and close >= lastLow
+
+if sweepUp
+    label.new(bar_index, high, "↑ sweep",
+         style=label.style_label_down, yloc=yloc.abovebar,
+         color=sweepColor, textcolor=color.black, size=size.tiny)
+
+if sweepDn
+    label.new(bar_index, low, "↓ sweep",
+         style=label.style_label_up, yloc=yloc.belowbar,
+         color=sweepColor, textcolor=color.black, size=size.tiny)
+
+// ─── Plottable signals (for M2+ to consume) ──────────────────────────
+// Exposed via plot() with display=display.none so later modules can
+// reference these or you can hook alertcondition() onto them.
+plot(bullBOS ? 1 : 0, "Signal: Bull BOS", display=display.none)
+plot(bearBOS ? 1 : 0, "Signal: Bear BOS", display=display.none)
+plot(sweepUp ? 1 : 0, "Signal: Sweep Up", display=display.none)
+plot(sweepDn ? 1 : 0, "Signal: Sweep Dn", display=display.none)
+
+// ─── Alerts ──────────────────────────────────────────────────────────
+alertcondition(bullBOS, "Bullish BOS", "FMES: Bullish Break of Structure")
+alertcondition(bearBOS, "Bearish BOS", "FMES: Bearish Break of Structure")
+alertcondition(sweepUp, "Wick Sweep Up", "FMES: Liquidity wick-sweep above swing high")
+alertcondition(sweepDn, "Wick Sweep Dn", "FMES: Liquidity wick-sweep below swing low")

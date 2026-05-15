@@ -1,0 +1,304 @@
+//@version=6
+// =====================================================================
+// FMES — Trade Setup Detector (v1.0)
+// Final combined script implementing the FMES / HTF Mystery strategy
+// by Marcell / Flipping Markets.
+//
+// Layers (all toggleable):
+//   M1 — Pivots, body-close BOS, wick sweeps (debug)
+//   M2 — Protected High/Low zones (sweep + opposing BOS + volume gap)
+//   M3 — Fibonacci 0/0.71/1, Order Block, Entry/SL/TP/TP1 lines
+//   M4 — LQ+ patterns: double / triple tops & bottoms
+//   M5 — HWR dual-limit: second entry at OB level, 1:2 RR target
+//
+// Not implemented (future):
+//   - Trendline LQ detection (rare, hard to mechanize reliably)
+//   - Setup state tracking (won / lost / invalidated fading)
+//   - Multi-pair scanning
+//   - Dynamic Fib redraw on pullback start
+// =====================================================================
+
+indicator("FMES — Trade Setup Detector", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+grpCore = "Core"
+pivotLen      = input.int(5,  "Pivot lookback",                1, 50,  group=grpCore)
+sweepWindow   = input.int(20, "Max bars between sweep & BOS",  1, 100, group=grpCore)
+requireVolGap = input.bool(true, "Require volume gap on BOS",         group=grpCore)
+
+grpM3 = "M3 — Trade Setup"
+showFib    = input.bool(true, "Show Fibonacci dotted lines",       group=grpM3)
+showOB     = input.bool(true, "Show Order Block box",              group=grpM3)
+showLevels = input.bool(true, "Show Entry / SL / TP lines",        group=grpM3)
+showLabels = input.bool(true, "Show price labels",                 group=grpM3)
+extendBars = input.int(60, "Extend setup levels right (bars)", 0, 300, group=grpM3)
+
+grpM4 = "M4 — LQ+ Patterns"
+showLQPlus  = input.bool(true, "Detect double/triple tops & bottoms", group=grpM4)
+lqTolerance = input.float(0.3, "Equal-level tolerance (× ATR)", 0.05, 1.0, step=0.05, group=grpM4)
+lqWindow    = input.int(40, "Lookback window for equal levels (bars)", 5, 200, group=grpM4)
+
+grpM5 = "M5 — HWR Dual-Limit"
+enableHWR   = input.bool(true, "Enable HWR dual-limit (Fib + OB)", group=grpM5)
+hwrTargetRR = input.float(2.0, "OB limit target R:R", 0.5, 5.0, step=0.5, group=grpM5)
+
+grpDbg = "Debug / Layer toggles"
+showProtZones = input.bool(true,  "Show M2 Protected zones (PSH/PSL)", group=grpDbg)
+showVolGaps   = input.bool(false, "Show volume gap boxes",             group=grpDbg)
+debugMode     = input.bool(false, "Show raw M1 pivot/BOS/sweep markers", group=grpDbg)
+
+grpColor = "Colors"
+bullColor   = input.color(#26a69a, "Bullish",  group=grpColor)
+bearColor   = input.color(#ef5350, "Bearish",  group=grpColor)
+sweepColor  = input.color(#ffa726, "Sweep",    group=grpColor)
+protBorder  = input.color(#ab47bc, "Protected border", group=grpColor)
+protFill    = input.color(color.new(#ab47bc, 80), "Protected fill", group=grpColor)
+volGapFill  = input.color(color.new(#42a5f5, 75), "Volume gap fill", group=grpColor)
+entryColor  = input.color(#4caf50, "Entry (Fib 0.71)",   group=grpColor)
+slColor     = input.color(#f44336, "Stop Loss (Fib 1)",  group=grpColor)
+tpColor     = input.color(#00bcd4, "Take Profit",        group=grpColor)
+obFill      = input.color(color.new(#ffd54f, 70), "OB fill",   group=grpColor)
+obBorder    = input.color(#ffa000, "OB border",          group=grpColor)
+fibColor    = input.color(color.new(#9e9e9e, 50), "Fib dotted lines", group=grpColor)
+lqColor     = input.color(#fbc02d, "LQ+ pattern",        group=grpColor)
+hwrColor    = input.color(#7e57c2, "HWR (OB limit)",     group=grpColor)
+
+// ─── Pivots & ATR ────────────────────────────────────────────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+atr14     = ta.atr(14)
+zoneThick = atr14 * 0.15
+
+// ─── State ───────────────────────────────────────────────────────────
+var float lastHigh    = na
+var int   lastHighBar = na
+var bool  bosFiredUp  = false
+
+var float lastLow    = na
+var int   lastLowBar = na
+var bool  bosFiredDn = false
+
+var float pendSwH    = na
+var int   pendSwHBar = na
+var bool  waitBearBOS = false
+
+var float pendSwL    = na
+var int   pendSwLBar = na
+var bool  waitBullBOS = false
+
+// M4 — recent pivot arrays for equal-level detection
+var array<float> recentPHPrices = array.new<float>()
+var array<int>   recentPHBars   = array.new<int>()
+var array<float> recentPLPrices = array.new<float>()
+var array<int>   recentPLBars   = array.new<int>()
+
+// ─── Pivot registration ──────────────────────────────────────────────
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - pivotLen
+    bosFiredUp  := false
+    if debugMode
+        label.new(lastHighBar, ph, "H", style=label.style_label_down, yloc=yloc.abovebar, color=color.new(bullColor, 80), textcolor=color.white, size=size.tiny)
+
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - pivotLen
+    bosFiredDn := false
+    if debugMode
+        label.new(lastLowBar, pl, "L", style=label.style_label_up, yloc=yloc.belowbar, color=color.new(bearColor, 80), textcolor=color.white, size=size.tiny)
+
+// ─── M4 — LQ+ pattern detection ──────────────────────────────────────
+checkEqualLevels(curPrice, curBar, prices, bars, tol, window) =>
+    matchCount = 0
+    firstMatchBar = 0
+    if array.size(prices) > 0
+        for i = 0 to array.size(prices) - 1
+            prior = array.get(prices, i)
+            priorBar = array.get(bars, i)
+            if math.abs(curPrice - prior) <= tol and (curBar - priorBar) >= 3 and (curBar - priorBar) <= window
+                matchCount := matchCount + 1
+                if matchCount == 1
+                    firstMatchBar := priorBar
+    [matchCount, firstMatchBar]
+
+if not na(ph) and showLQPlus
+    curBar = bar_index - pivotLen
+    tol = atr14 * lqTolerance
+    [mcH, fmbH] = checkEqualLevels(ph, curBar, recentPHPrices, recentPHBars, tol, lqWindow)
+    if mcH >= 1
+        patType = mcH >= 2 ? "TT" : "DT"
+        line.new(fmbH, ph, curBar, ph, color=lqColor, style=line.style_dashed, width=1)
+        label.new(curBar, ph, patType, style=label.style_label_down, yloc=yloc.abovebar, color=lqColor, textcolor=color.black, size=size.tiny)
+    array.push(recentPHPrices, ph)
+    array.push(recentPHBars, curBar)
+    if array.size(recentPHPrices) > 30
+        array.shift(recentPHPrices)
+        array.shift(recentPHBars)
+
+if not na(pl) and showLQPlus
+    curBar = bar_index - pivotLen
+    tol = atr14 * lqTolerance
+    [mcL, fmbL] = checkEqualLevels(pl, curBar, recentPLPrices, recentPLBars, tol, lqWindow)
+    if mcL >= 1
+        patType = mcL >= 2 ? "TT" : "DT"
+        line.new(fmbL, pl, curBar, pl, color=lqColor, style=line.style_dashed, width=1)
+        label.new(curBar, pl, patType, style=label.style_label_up, yloc=yloc.belowbar, color=lqColor, textcolor=color.black, size=size.tiny)
+    array.push(recentPLPrices, pl)
+    array.push(recentPLBars, curBar)
+    if array.size(recentPLPrices) > 30
+        array.shift(recentPLPrices)
+        array.shift(recentPLBars)
+
+// ─── Wick sweep ──────────────────────────────────────────────────────
+sweepUp = not na(lastHigh) and high > lastHigh and close <= lastHigh
+sweepDn = not na(lastLow)  and low  < lastLow  and close >= lastLow
+
+if sweepUp
+    pendSwH     := lastHigh
+    pendSwHBar  := bar_index
+    waitBearBOS := true
+
+if sweepDn
+    pendSwL     := lastLow
+    pendSwLBar  := bar_index
+    waitBullBOS := true
+
+// ─── BOS ─────────────────────────────────────────────────────────────
+bullBOS = not na(lastHigh) and close > lastHigh and not bosFiredUp
+bearBOS = not na(lastLow)  and close < lastLow  and not bosFiredDn
+
+if bullBOS
+    bosFiredUp := true
+if bearBOS
+    bosFiredDn := true
+
+// ─── Volume gap geometry ─────────────────────────────────────────────
+bullGap = high[2] < low[0]
+bearGap = low[2]  > high[0]
+
+// ─── Protected confirmation (M2) ─────────────────────────────────────
+protHighOK = waitBearBOS and bearBOS and (bar_index - pendSwHBar <= sweepWindow) and (not requireVolGap or bearGap)
+protLowOK  = waitBullBOS and bullBOS and (bar_index - pendSwLBar <= sweepWindow) and (not requireVolGap or bullGap)
+
+// ─── M3 + M5: full trade setup on PSH/PSL ────────────────────────────
+if protHighOK
+    swhPrice = pendSwH
+    swLow    = low
+    rng      = swhPrice - swLow
+    entryPx  = swLow + 0.71 * rng
+    slPx     = swhPrice
+    tp2Px    = swLow
+    tp1Px    = swLow - 0.27 * rng
+    rightX   = bar_index + extendBars
+
+    sweepBarAgo = bar_index - pendSwHBar
+    obTop = high[sweepBarAgo]
+    obBot = math.max(open[sweepBarAgo], close[sweepBarAgo])
+
+    if showFib
+        line.new(pendSwHBar, slPx,    rightX, slPx,    color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwHBar, entryPx, rightX, entryPx, color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwHBar, tp2Px,   rightX, tp2Px,   color=fibColor, style=line.style_dotted, width=1)
+
+    if showOB
+        box.new(pendSwHBar, obTop, rightX, obBot, bgcolor=obFill, border_color=obBorder, border_width=1)
+
+    if showLevels
+        line.new(bar_index, entryPx, rightX, entryPx, color=entryColor, style=line.style_solid,  width=2)
+        line.new(bar_index, slPx,    rightX, slPx,    color=slColor,    style=line.style_solid,  width=2)
+        line.new(bar_index, tp1Px,   rightX, tp1Px,   color=tpColor,    style=line.style_dashed, width=1)
+        line.new(bar_index, tp2Px,   rightX, tp2Px,   color=tpColor,    style=line.style_solid,  width=2)
+
+    if showLabels
+        label.new(rightX, entryPx, "Entry " + str.tostring(entryPx, format.mintick), style=label.style_label_left, color=entryColor, textcolor=color.white, size=size.small)
+        label.new(rightX, slPx,    "SL "    + str.tostring(slPx,    format.mintick), style=label.style_label_left, color=slColor,    textcolor=color.white, size=size.small)
+        label.new(rightX, tp2Px,   "TP "    + str.tostring(tp2Px,   format.mintick) + "  |  2.45R", style=label.style_label_left, color=tpColor, textcolor=color.white, size=size.small)
+        label.new(rightX, tp1Px,   "TP1 "   + str.tostring(tp1Px,   format.mintick) + " (-0.27)",   style=label.style_label_left, color=color.new(tpColor, 30), textcolor=color.white, size=size.tiny)
+
+    // M5 HWR — second limit at OB bottom (deeper retracement for short)
+    if enableHWR
+        obEntryPx = obBot          // bottom of OB; price has to rally further to hit
+        obRisk    = slPx - obEntryPx
+        obTPPx    = obEntryPx - obRisk * hwrTargetRR
+        line.new(bar_index, obEntryPx, rightX, obEntryPx, color=hwrColor, style=line.style_solid, width=2)
+        line.new(bar_index, obTPPx,    rightX, obTPPx,    color=color.new(hwrColor, 30), style=line.style_dashed, width=1)
+        if showLabels
+            label.new(rightX, obEntryPx, "OB Entry " + str.tostring(obEntryPx, format.mintick), style=label.style_label_left, color=hwrColor, textcolor=color.white, size=size.tiny)
+            label.new(rightX, obTPPx,    "OB TP "    + str.tostring(obTPPx,    format.mintick) + " (1:" + str.tostring(hwrTargetRR, "#.#") + ")", style=label.style_label_left, color=color.new(hwrColor, 30), textcolor=color.white, size=size.tiny)
+
+    if showProtZones
+        box.new(pendSwHBar, pendSwH + zoneThick, rightX, pendSwH - zoneThick, bgcolor=protFill, border_color=protBorder, border_width=1)
+        label.new(pendSwHBar, pendSwH, "PSH (short)", style=label.style_label_down, yloc=yloc.abovebar, color=protBorder, textcolor=color.white, size=size.small)
+
+    waitBearBOS := false
+
+if protLowOK
+    swlPrice = pendSwL
+    swHigh   = high
+    rng      = swHigh - swlPrice
+    entryPx  = swHigh - 0.71 * rng
+    slPx     = swlPrice
+    tp2Px    = swHigh
+    tp1Px    = swHigh + 0.27 * rng
+    rightX   = bar_index + extendBars
+
+    sweepBarAgo = bar_index - pendSwLBar
+    obTop = math.min(open[sweepBarAgo], close[sweepBarAgo])
+    obBot = low[sweepBarAgo]
+
+    if showFib
+        line.new(pendSwLBar, slPx,    rightX, slPx,    color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwLBar, entryPx, rightX, entryPx, color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwLBar, tp2Px,   rightX, tp2Px,   color=fibColor, style=line.style_dotted, width=1)
+
+    if showOB
+        box.new(pendSwLBar, obTop, rightX, obBot, bgcolor=obFill, border_color=obBorder, border_width=1)
+
+    if showLevels
+        line.new(bar_index, entryPx, rightX, entryPx, color=entryColor, style=line.style_solid,  width=2)
+        line.new(bar_index, slPx,    rightX, slPx,    color=slColor,    style=line.style_solid,  width=2)
+        line.new(bar_index, tp1Px,   rightX, tp1Px,   color=tpColor,    style=line.style_dashed, width=1)
+        line.new(bar_index, tp2Px,   rightX, tp2Px,   color=tpColor,    style=line.style_solid,  width=2)
+
+    if showLabels
+        label.new(rightX, entryPx, "Entry " + str.tostring(entryPx, format.mintick), style=label.style_label_left, color=entryColor, textcolor=color.white, size=size.small)
+        label.new(rightX, slPx,    "SL "    + str.tostring(slPx,    format.mintick), style=label.style_label_left, color=slColor,    textcolor=color.white, size=size.small)
+        label.new(rightX, tp2Px,   "TP "    + str.tostring(tp2Px,   format.mintick) + "  |  2.45R", style=label.style_label_left, color=tpColor, textcolor=color.white, size=size.small)
+        label.new(rightX, tp1Px,   "TP1 "   + str.tostring(tp1Px,   format.mintick) + " (-0.27)",   style=label.style_label_left, color=color.new(tpColor, 30), textcolor=color.white, size=size.tiny)
+
+    // M5 HWR — second limit at OB top (deeper retracement for long)
+    if enableHWR
+        obEntryPx = obTop          // top of OB; price has to drop further to hit
+        obRisk    = obEntryPx - slPx
+        obTPPx    = obEntryPx + obRisk * hwrTargetRR
+        line.new(bar_index, obEntryPx, rightX, obEntryPx, color=hwrColor, style=line.style_solid, width=2)
+        line.new(bar_index, obTPPx,    rightX, obTPPx,    color=color.new(hwrColor, 30), style=line.style_dashed, width=1)
+        if showLabels
+            label.new(rightX, obEntryPx, "OB Entry " + str.tostring(obEntryPx, format.mintick), style=label.style_label_left, color=hwrColor, textcolor=color.white, size=size.tiny)
+            label.new(rightX, obTPPx,    "OB TP "    + str.tostring(obTPPx,    format.mintick) + " (1:" + str.tostring(hwrTargetRR, "#.#") + ")", style=label.style_label_left, color=color.new(hwrColor, 30), textcolor=color.white, size=size.tiny)
+
+    if showProtZones
+        box.new(pendSwLBar, pendSwL + zoneThick, rightX, pendSwL - zoneThick, bgcolor=protFill, border_color=protBorder, border_width=1)
+        label.new(pendSwLBar, pendSwL, "PSL (long)", style=label.style_label_up, yloc=yloc.belowbar, color=protBorder, textcolor=color.white, size=size.small)
+
+    waitBullBOS := false
+
+// ─── Volume gap visualization (debug) ────────────────────────────────
+if showVolGaps
+    if bullBOS and bullGap
+        box.new(bar_index - 2, low[0], bar_index, high[2], bgcolor=volGapFill, border_color=color.new(#42a5f5, 30), border_width=1)
+    if bearBOS and bearGap
+        box.new(bar_index - 2, low[2], bar_index, high[0], bgcolor=volGapFill, border_color=color.new(#42a5f5, 30), border_width=1)
+
+// ─── Stale sweep cleanup ─────────────────────────────────────────────
+if waitBearBOS and (bar_index - pendSwHBar > sweepWindow)
+    waitBearBOS := false
+
+if waitBullBOS and (bar_index - pendSwLBar > sweepWindow)
+    waitBullBOS := false
+
+// ─── Alerts ──────────────────────────────────────────────────────────
+alertcondition(protHighOK, "Short Setup Ready", "FMES: SHORT setup ready — Entry / SL / TP / OB plotted on chart")
+alertcondition(protLowOK,  "Long Setup Ready",  "FMES: LONG setup ready — Entry / SL / TP / OB plotted on chart")

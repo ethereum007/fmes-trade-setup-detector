@@ -1,0 +1,229 @@
+//@version=6
+// =====================================================================
+// FMES / HTF Mystery — Module 3: Trade Setup
+// Builds on M2. When a Protected High / Low is confirmed, draws the
+// full FMES trade setup:
+//   - Fibonacci levels (0, 0.71, 1) on the impulse
+//   - Order Block box at the swept extreme
+//   - Entry line at Fib 0.71      (green, solid)
+//   - SL line at Fib 1             (red, solid)
+//   - TP1 line at Fib -0.27       (cyan, dashed) — partial / extension
+//   - TP2 line at Fib 0            (cyan, solid)  — main target / 2.45R
+// All levels extend to the right by `extendBars` so price can come to them.
+//
+// LIMITATION: Fib is drawn at the moment of BOS confirmation using the
+// BOS bar's high/low as the impulse extreme. If the impulse extends
+// further before pullback begins, the Fib will be slightly off. M5 will
+// add dynamic redraw on pullback detection.
+// =====================================================================
+
+indicator("FMES M3 — Trade Setup", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+grpCore = "Core"
+pivotLen      = input.int(5,  "Pivot lookback",                1, 50,  group=grpCore)
+sweepWindow   = input.int(20, "Max bars between sweep & BOS",  1, 100, group=grpCore)
+requireVolGap = input.bool(true, "Require volume gap on BOS",        group=grpCore)
+
+grpM3 = "M3 — Trade Setup"
+showFib    = input.bool(true, "Show Fibonacci dotted lines",     group=grpM3)
+showOB     = input.bool(true, "Show Order Block box",            group=grpM3)
+showLevels = input.bool(true, "Show Entry / SL / TP lines",      group=grpM3)
+showLabels = input.bool(true, "Show Entry / SL / TP price labels", group=grpM3)
+extendBars = input.int(60, "Extend setup levels right (bars)", 0, 300, group=grpM3)
+
+grpDbg = "Debug / Layer toggles"
+showProtZones = input.bool(true,  "Show M2 Protected zones (PSH/PSL)", group=grpDbg)
+showVolGaps   = input.bool(false, "Show volume gap boxes",             group=grpDbg)
+debugMode     = input.bool(false, "Show raw M1 markers",               group=grpDbg)
+
+grpColor = "Colors"
+bullColor   = input.color(#26a69a, "Bullish",  group=grpColor)
+bearColor   = input.color(#ef5350, "Bearish",  group=grpColor)
+sweepColor  = input.color(#ffa726, "Sweep",    group=grpColor)
+protBorder  = input.color(#ab47bc, "Protected border", group=grpColor)
+protFill    = input.color(color.new(#ab47bc, 80), "Protected fill", group=grpColor)
+volGapFill  = input.color(color.new(#42a5f5, 75), "Volume gap fill", group=grpColor)
+entryColor  = input.color(#4caf50, "Entry (0.71)",       group=grpColor)
+slColor     = input.color(#f44336, "Stop Loss (1)",      group=grpColor)
+tpColor     = input.color(#00bcd4, "Take Profit",        group=grpColor)
+obFill      = input.color(color.new(#ffd54f, 70), "OB fill",   group=grpColor)
+obBorder    = input.color(#ffa000, "OB border",          group=grpColor)
+fibColor    = input.color(color.new(#9e9e9e, 50), "Fib dotted lines", group=grpColor)
+
+// ─── Pivots & ATR ────────────────────────────────────────────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+atr14     = ta.atr(14)
+zoneThick = atr14 * 0.15
+
+// ─── State ───────────────────────────────────────────────────────────
+var float lastHigh    = na
+var int   lastHighBar = na
+var bool  bosFiredUp  = false
+
+var float lastLow    = na
+var int   lastLowBar = na
+var bool  bosFiredDn = false
+
+var float pendSwH    = na
+var int   pendSwHBar = na
+var bool  waitBearBOS = false
+
+var float pendSwL    = na
+var int   pendSwLBar = na
+var bool  waitBullBOS = false
+
+// ─── Pivot registration ──────────────────────────────────────────────
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - pivotLen
+    bosFiredUp  := false
+    if debugMode
+        label.new(lastHighBar, ph, "H", style=label.style_label_down, yloc=yloc.abovebar, color=color.new(bullColor, 80), textcolor=color.white, size=size.tiny)
+
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - pivotLen
+    bosFiredDn := false
+    if debugMode
+        label.new(lastLowBar, pl, "L", style=label.style_label_up, yloc=yloc.belowbar, color=color.new(bearColor, 80), textcolor=color.white, size=size.tiny)
+
+// ─── Wick sweep ──────────────────────────────────────────────────────
+sweepUp = not na(lastHigh) and high > lastHigh and close <= lastHigh
+sweepDn = not na(lastLow)  and low  < lastLow  and close >= lastLow
+
+if sweepUp
+    pendSwH     := lastHigh
+    pendSwHBar  := bar_index
+    waitBearBOS := true
+
+if sweepDn
+    pendSwL     := lastLow
+    pendSwLBar  := bar_index
+    waitBullBOS := true
+
+// ─── BOS ─────────────────────────────────────────────────────────────
+bullBOS = not na(lastHigh) and close > lastHigh and not bosFiredUp
+bearBOS = not na(lastLow)  and close < lastLow  and not bosFiredDn
+
+if bullBOS
+    bosFiredUp := true
+if bearBOS
+    bosFiredDn := true
+
+// ─── Volume gap geometry (FMES p.30) ─────────────────────────────────
+bullGap = high[2] < low[0]
+bearGap = low[2]  > high[0]
+
+// ─── Protected confirmation (M2) ─────────────────────────────────────
+protHighOK = waitBearBOS and bearBOS and (bar_index - pendSwHBar <= sweepWindow) and (not requireVolGap or bearGap)
+protLowOK  = waitBullBOS and bullBOS and (bar_index - pendSwLBar <= sweepWindow) and (not requireVolGap or bullGap)
+
+// ─── M3: Draw the trade setup ────────────────────────────────────────
+// For PSH (bearish setup): Fib drawn from BOS bar's low up to swept high.
+//   Fib 0 = target (recent swing low), Fib 1 = SL (swept high), 0.71 = entry.
+//   OB sits at the swept high — last bullish wick before the bearish impulse.
+//
+// For PSL (bullish setup): mirrored.
+
+if protHighOK
+    swhPrice = pendSwH                                     // Fib 1 / SL
+    swLow    = low                                         // Fib 0 / TP2 (BOS bar's low)
+    rng      = swhPrice - swLow
+    entryPx  = swLow + 0.71 * rng                          // Fib 0.71
+    slPx     = swhPrice
+    tp2Px    = swLow                                       // Fib 0
+    tp1Px    = swLow - 0.27 * rng                          // Fib -0.27 (extension)
+    rightX   = bar_index + extendBars
+
+    // OB at the swept high — body-top to wick-high of the sweep bar
+    sweepBarAgo = bar_index - pendSwHBar
+    obTop = high[sweepBarAgo]
+    obBot = math.max(open[sweepBarAgo], close[sweepBarAgo])
+
+    if showFib
+        line.new(pendSwHBar, slPx,    rightX, slPx,    color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwHBar, entryPx, rightX, entryPx, color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwHBar, tp2Px,   rightX, tp2Px,   color=fibColor, style=line.style_dotted, width=1)
+
+    if showOB
+        box.new(pendSwHBar, obTop, rightX, obBot, bgcolor=obFill, border_color=obBorder, border_width=1)
+
+    if showLevels
+        line.new(bar_index, entryPx, rightX, entryPx, color=entryColor, style=line.style_solid,  width=2)
+        line.new(bar_index, slPx,    rightX, slPx,    color=slColor,    style=line.style_solid,  width=2)
+        line.new(bar_index, tp1Px,   rightX, tp1Px,   color=tpColor,    style=line.style_dashed, width=1)
+        line.new(bar_index, tp2Px,   rightX, tp2Px,   color=tpColor,    style=line.style_solid,  width=2)
+
+    if showLabels
+        label.new(rightX, entryPx, "Entry " + str.tostring(entryPx, format.mintick),                       style=label.style_label_left, color=entryColor, textcolor=color.white, size=size.small)
+        label.new(rightX, slPx,    "SL "    + str.tostring(slPx,    format.mintick),                       style=label.style_label_left, color=slColor,    textcolor=color.white, size=size.small)
+        label.new(rightX, tp2Px,   "TP "    + str.tostring(tp2Px,   format.mintick) + "  |  R:R 2.45",     style=label.style_label_left, color=tpColor,    textcolor=color.white, size=size.small)
+        label.new(rightX, tp1Px,   "TP1 "   + str.tostring(tp1Px,   format.mintick) + " (-0.27)",          style=label.style_label_left, color=color.new(tpColor, 30), textcolor=color.white, size=size.tiny)
+
+    if showProtZones
+        box.new(pendSwHBar, pendSwH + zoneThick, rightX, pendSwH - zoneThick, bgcolor=protFill, border_color=protBorder, border_width=1)
+        label.new(pendSwHBar, pendSwH, "PSH (short)", style=label.style_label_down, yloc=yloc.abovebar, color=protBorder, textcolor=color.white, size=size.small)
+
+    waitBearBOS := false
+
+if protLowOK
+    swlPrice = pendSwL                                     // Fib 1 / SL
+    swHigh   = high                                        // Fib 0 / TP2 (BOS bar's high)
+    rng      = swHigh - swlPrice
+    entryPx  = swHigh - 0.71 * rng                         // Fib 0.71
+    slPx     = swlPrice
+    tp2Px    = swHigh                                      // Fib 0
+    tp1Px    = swHigh + 0.27 * rng                         // Fib -0.27 (extension)
+    rightX   = bar_index + extendBars
+
+    sweepBarAgo = bar_index - pendSwLBar
+    obTop = math.min(open[sweepBarAgo], close[sweepBarAgo])
+    obBot = low[sweepBarAgo]
+
+    if showFib
+        line.new(pendSwLBar, slPx,    rightX, slPx,    color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwLBar, entryPx, rightX, entryPx, color=fibColor, style=line.style_dotted, width=1)
+        line.new(pendSwLBar, tp2Px,   rightX, tp2Px,   color=fibColor, style=line.style_dotted, width=1)
+
+    if showOB
+        box.new(pendSwLBar, obTop, rightX, obBot, bgcolor=obFill, border_color=obBorder, border_width=1)
+
+    if showLevels
+        line.new(bar_index, entryPx, rightX, entryPx, color=entryColor, style=line.style_solid,  width=2)
+        line.new(bar_index, slPx,    rightX, slPx,    color=slColor,    style=line.style_solid,  width=2)
+        line.new(bar_index, tp1Px,   rightX, tp1Px,   color=tpColor,    style=line.style_dashed, width=1)
+        line.new(bar_index, tp2Px,   rightX, tp2Px,   color=tpColor,    style=line.style_solid,  width=2)
+
+    if showLabels
+        label.new(rightX, entryPx, "Entry " + str.tostring(entryPx, format.mintick),                   style=label.style_label_left, color=entryColor, textcolor=color.white, size=size.small)
+        label.new(rightX, slPx,    "SL "    + str.tostring(slPx,    format.mintick),                   style=label.style_label_left, color=slColor,    textcolor=color.white, size=size.small)
+        label.new(rightX, tp2Px,   "TP "    + str.tostring(tp2Px,   format.mintick) + "  |  R:R 2.45", style=label.style_label_left, color=tpColor,    textcolor=color.white, size=size.small)
+        label.new(rightX, tp1Px,   "TP1 "   + str.tostring(tp1Px,   format.mintick) + " (-0.27)",      style=label.style_label_left, color=color.new(tpColor, 30), textcolor=color.white, size=size.tiny)
+
+    if showProtZones
+        box.new(pendSwLBar, pendSwL + zoneThick, rightX, pendSwL - zoneThick, bgcolor=protFill, border_color=protBorder, border_width=1)
+        label.new(pendSwLBar, pendSwL, "PSL (long)", style=label.style_label_up, yloc=yloc.belowbar, color=protBorder, textcolor=color.white, size=size.small)
+
+    waitBullBOS := false
+
+// ─── Volume gap visualization (debug) ────────────────────────────────
+if showVolGaps
+    if bullBOS and bullGap
+        box.new(bar_index - 2, low[0], bar_index, high[2], bgcolor=volGapFill, border_color=color.new(#42a5f5, 30), border_width=1)
+    if bearBOS and bearGap
+        box.new(bar_index - 2, low[2], bar_index, high[0], bgcolor=volGapFill, border_color=color.new(#42a5f5, 30), border_width=1)
+
+// ─── Stale sweep cleanup ─────────────────────────────────────────────
+if waitBearBOS and (bar_index - pendSwHBar > sweepWindow)
+    waitBearBOS := false
+
+if waitBullBOS and (bar_index - pendSwLBar > sweepWindow)
+    waitBullBOS := false
+
+// ─── Alerts ──────────────────────────────────────────────────────────
+alertcondition(protHighOK, "Short Setup Ready", "FMES: SHORT setup — Entry / SL / TP plotted on chart")
+alertcondition(protLowOK,  "Long Setup Ready",  "FMES: LONG setup — Entry / SL / TP plotted on chart")

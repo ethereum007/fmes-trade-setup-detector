@@ -1,0 +1,200 @@
+//@version=6
+// =====================================================================
+// FMES / HTF Mystery — Module 2: Protected Structure
+// Builds on M1. Filters raw BOS/sweeps into FMES-valid setups by
+// requiring the sweep → opposing BOS → volume-gap sequence.
+//
+// Detects:
+//   - Protected High (PSH) — wick swept a swing high, then bearish BOS
+//     followed within N bars, with volume gap on BOS bar (optional)
+//   - Protected Low  (PSL) — symmetric
+//   - Volume gaps    — 3-bar pattern: top of 1st vs bottom of 3rd
+//
+// PSH / PSL are the high-quality reversal zones the FMES strategy uses
+// as future limit-order anchors (M3 will draw Fibs from these).
+//
+// Raw M1 outputs (pivots, BOS lines, sweep tags) are hidden by default;
+// turn on Debug mode to see them.
+// =====================================================================
+
+indicator("FMES M2 — Protected Structure", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=200)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+grpCore = "Core (M1 inherited)"
+pivotLen = input.int(5, "Pivot lookback", minval=1, maxval=50, group=grpCore)
+
+grpM2 = "M2 — Protected Structure"
+sweepWindow = input.int(20, "Max bars between sweep & opposing BOS",
+     minval=1, maxval=100, group=grpM2,
+     tooltip="If opposing BOS doesn't fire within this many bars after the sweep, the sweep is stale and discarded.")
+requireVolGap = input.bool(true, "Require volume gap on BOS bar",
+     group=grpM2,
+     tooltip="FMES rule: BOS without volume gap = invalid setup.")
+
+grpDisp = "Display"
+showProtZones = input.bool(true, "Show Protected High/Low zones", group=grpDisp)
+showVolGaps   = input.bool(true, "Show volume gap boxes",         group=grpDisp)
+extendBars    = input.int(50, "Extend protected zones right (bars)",
+     minval=0, maxval=300, group=grpDisp)
+
+grpDbg = "Debug"
+debugMode = input.bool(false, "Show raw pivots / BOS / sweeps (M1 layer)",
+     group=grpDbg, tooltip="For debugging detection logic. Off in normal use.")
+
+grpColor = "Colors"
+bullColor     = input.color(#26a69a, "Bullish",   group=grpColor)
+bearColor     = input.color(#ef5350, "Bearish",   group=grpColor)
+sweepColor    = input.color(#ffa726, "Sweep",     group=grpColor)
+protectBorder = input.color(#ab47bc, "Protected zone border",     group=grpColor)
+protectFill   = input.color(color.new(#ab47bc, 80), "Protected fill",  group=grpColor)
+volGapFill    = input.color(color.new(#42a5f5, 75), "Volume gap fill", group=grpColor)
+
+// ─── Pivots & ATR ────────────────────────────────────────────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+atr14     = ta.atr(14)
+zoneThick = atr14 * 0.15      // protected-zone box half-height
+
+// ─── State ───────────────────────────────────────────────────────────
+var float lastHigh    = na
+var int   lastHighBar = na
+var bool  bosFiredUp  = false
+
+var float lastLow    = na
+var int   lastLowBar = na
+var bool  bosFiredDn = false
+
+// Pending sweep tracking — set when a wick-sweep fires, cleared on
+// confirmation or expiry.
+var float pendSwH    = na
+var int   pendSwHBar = na
+var bool  waitBearBOS = false
+
+var float pendSwL    = na
+var int   pendSwLBar = na
+var bool  waitBullBOS = false
+
+// ─── Pivot registration ──────────────────────────────────────────────
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - pivotLen
+    bosFiredUp  := false
+    if debugMode
+        label.new(lastHighBar, ph, "H",
+             style=label.style_label_down, yloc=yloc.abovebar,
+             color=color.new(bullColor, 80), textcolor=color.white,
+             size=size.tiny)
+
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - pivotLen
+    bosFiredDn := false
+    if debugMode
+        label.new(lastLowBar, pl, "L",
+             style=label.style_label_up, yloc=yloc.belowbar,
+             color=color.new(bearColor, 80), textcolor=color.white,
+             size=size.tiny)
+
+// ─── Wick sweep → start pending watch ────────────────────────────────
+sweepUp = not na(lastHigh) and high > lastHigh and close <= lastHigh
+sweepDn = not na(lastLow)  and low  < lastLow  and close >= lastLow
+
+if sweepUp
+    pendSwH     := lastHigh
+    pendSwHBar  := bar_index
+    waitBearBOS := true
+    if debugMode
+        label.new(bar_index, high, "sw",
+             style=label.style_label_down, yloc=yloc.abovebar,
+             color=sweepColor, textcolor=color.black, size=size.tiny)
+
+if sweepDn
+    pendSwL     := lastLow
+    pendSwLBar  := bar_index
+    waitBullBOS := true
+    if debugMode
+        label.new(bar_index, low, "sw",
+             style=label.style_label_up, yloc=yloc.belowbar,
+             color=sweepColor, textcolor=color.black, size=size.tiny)
+
+// ─── BOS detection (body close past last unbroken swing) ─────────────
+bullBOS = not na(lastHigh) and close > lastHigh and not bosFiredUp
+bearBOS = not na(lastLow)  and close < lastLow  and not bosFiredDn
+
+if bullBOS
+    bosFiredUp := true
+    if debugMode
+        line.new(lastHighBar, lastHigh, bar_index, lastHigh,
+             color=bullColor, width=1)
+
+if bearBOS
+    bosFiredDn := true
+    if debugMode
+        line.new(lastLowBar, lastLow, bar_index, lastLow,
+             color=bearColor, width=1)
+
+// ─── Volume gap geometry (FMES p.30) ─────────────────────────────────
+// 1st candle = [2] (oldest), 3rd candle = [0] (current).
+// Bullish gap: high[2] (top of 1st) BELOW low[0]   (bottom of 3rd).
+// Bearish gap: low[2]  (bottom of 1st) ABOVE high[0] (top of 3rd).
+bullGap = high[2] < low[0]
+bearGap = low[2]  > high[0]
+
+// ─── Protected structure confirmation ────────────────────────────────
+// Protected HIGH = a wick-swept swing high that is then followed by a
+// bearish BOS within sweepWindow bars (+ volume gap if required).
+// The swept high becomes a high-conviction supply zone.
+protHighOK = waitBearBOS and bearBOS and (bar_index - pendSwHBar <= sweepWindow) and (not requireVolGap or bearGap)
+protLowOK  = waitBullBOS and bullBOS and (bar_index - pendSwLBar <= sweepWindow) and (not requireVolGap or bullGap)
+
+if protHighOK
+    if showProtZones
+        box.new(pendSwHBar, pendSwH + zoneThick,
+             bar_index + extendBars, pendSwH - zoneThick,
+             bgcolor=protectFill, border_color=protectBorder, border_width=1)
+        label.new(pendSwHBar, pendSwH, "PSH",
+             style=label.style_label_down, yloc=yloc.abovebar,
+             color=protectBorder, textcolor=color.white, size=size.small)
+    waitBearBOS := false
+
+if protLowOK
+    if showProtZones
+        box.new(pendSwLBar, pendSwL + zoneThick,
+             bar_index + extendBars, pendSwL - zoneThick,
+             bgcolor=protectFill, border_color=protectBorder, border_width=1)
+        label.new(pendSwLBar, pendSwL, "PSL",
+             style=label.style_label_up, yloc=yloc.belowbar,
+             color=protectBorder, textcolor=color.white, size=size.small)
+    waitBullBOS := false
+
+// ─── Volume gap visualization (independent of protection event) ──────
+if showVolGaps
+    if bullBOS and bullGap
+        box.new(bar_index - 2, low[0], bar_index, high[2],
+             bgcolor=volGapFill, border_color=color.new(#42a5f5, 30),
+             border_width=1)
+    if bearBOS and bearGap
+        box.new(bar_index - 2, low[2], bar_index, high[0],
+             bgcolor=volGapFill, border_color=color.new(#42a5f5, 30),
+             border_width=1)
+
+// ─── Stale sweep cleanup ─────────────────────────────────────────────
+if waitBearBOS and (bar_index - pendSwHBar > sweepWindow)
+    waitBearBOS := false
+
+if waitBullBOS and (bar_index - pendSwLBar > sweepWindow)
+    waitBullBOS := false
+
+// ─── Signal plots (for M3+ to consume) ───────────────────────────────
+plot(protHighOK ? 1 : 0, "Signal: Protected High", display=display.none)
+plot(protLowOK  ? 1 : 0, "Signal: Protected Low",  display=display.none)
+plot(bullGap    ? 1 : 0, "Signal: Bull Volume Gap", display=display.none)
+plot(bearGap    ? 1 : 0, "Signal: Bear Volume Gap", display=display.none)
+
+// ─── Alerts ──────────────────────────────────────────────────────────
+alertcondition(protHighOK, "Protected High formed",
+     "FMES: Protected High confirmed (sweep + bearish BOS + volume gap) — short setup zone")
+alertcondition(protLowOK, "Protected Low formed",
+     "FMES: Protected Low confirmed (sweep + bullish BOS + volume gap) — long setup zone")

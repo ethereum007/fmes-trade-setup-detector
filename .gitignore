@@ -1,0 +1,21 @@
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Reference PDFs (Marcell / Flipping Markets IP — do not redistribute)
+*.pdf
+
+# Screenshots / scratch
+screenshots/
+*.png
+*.jpg
+
+# Logs
+*.log
