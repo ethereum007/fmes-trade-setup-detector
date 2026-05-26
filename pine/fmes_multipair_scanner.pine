@@ -1,0 +1,199 @@
+//@version=6
+// =====================================================================
+// FMES Multi-Symbol Scanner (M7)
+// Scans up to 16 symbols and shows the most recent PSH/PSL setup for each
+// in a single table on the chart. No more chart-by-chart scanning.
+//
+// Setup: add to ANY chart, configure your 16 symbols in inputs, choose
+// the scan timeframe (default Daily), and a dashboard appears top-right.
+//
+// Each row shows:
+//   - Symbol
+//   - Setup direction (PSH = short, PSL = long, "-" = nothing recent)
+//   - Entry / SL / TP prices
+//   - Bars since signal (for "is it still actionable")
+// =====================================================================
+
+indicator("FMES Multi-Symbol Scanner", overlay=true,
+     max_lines_count=50, max_labels_count=50, max_boxes_count=50)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+grpSyms = "Symbols to Scan (up to 16)"
+sym1  = input.symbol("NSE:HFCL",       "1", group=grpSyms)
+sym2  = input.symbol("NSE:SAREGAMA",   "2", group=grpSyms)
+sym3  = input.symbol("NSE:DIXON",      "3", group=grpSyms)
+sym4  = input.symbol("NSE:RELIANCE",   "4", group=grpSyms)
+sym5  = input.symbol("NSE:TMPV",       "5", group=grpSyms)
+sym6  = input.symbol("NSE:ADANIPORTS", "6", group=grpSyms)
+sym7  = input.symbol("NSE:MOTHERSON",  "7", group=grpSyms)
+sym8  = input.symbol("NSE:BAJFINANCE", "8", group=grpSyms)
+sym9  = input.symbol("NSE:M_M",        "9", group=grpSyms)
+sym10 = input.symbol("NSE:DMART",     "10", group=grpSyms)
+sym11 = input.symbol("NSE:GRASIM",    "11", group=grpSyms)
+sym12 = input.symbol("NSE:EXIDEIND",  "12", group=grpSyms)
+sym13 = input.symbol("NSE:VBL",       "13", group=grpSyms)
+sym14 = input.symbol("NSE:NAUKRI",    "14", group=grpSyms)
+sym15 = input.symbol("NSE:MANKIND",   "15", group=grpSyms)
+sym16 = input.symbol("NSE:PERSISTENT","16", group=grpSyms)
+
+grpScan = "Scan Settings"
+scanTF      = input.timeframe("D", "Scan timeframe", options=["60","240","D","W"], group=grpScan)
+maxBarsAgo  = input.int(30, "Show setups within last N bars (0 = all)", 0, 500, group=grpScan, tooltip="Filter: only show setups formed within this many bars. On Daily = trading days. 0 = no filter.")
+
+grpRules = "FMES Rules"
+pivotLen      = input.int(5,  "Pivot lookback",                1, 50,  group=grpRules)
+sweepWindow   = input.int(20, "Max bars between sweep & BOS",  1, 100, group=grpRules)
+requireVolGap = input.bool(true, "Require volume gap on BOS",        group=grpRules)
+
+grpTbl = "Table"
+tblPos    = input.string("top_right", "Position", options=["top_right","top_left","bottom_right","bottom_left","middle_right"], group=grpTbl)
+tblTextSize = input.string("small", "Text size", options=["tiny","small","normal","large"], group=grpTbl)
+
+// ─── Detection function (wrapped for request.security) ───────────────
+calcSetup() =>
+    var float lastHigh = na
+    var bool  bosFiredUp = false
+    var float lastLow  = na
+    var bool  bosFiredDn = false
+    var float pendSwH   = na
+    var int   pendSwHBar = na
+    var bool  waitBearBOS = false
+    var float pendSwL   = na
+    var int   pendSwLBar = na
+    var bool  waitBullBOS = false
+
+    var int   lastSignalBar = na
+    var int   signalType    = 0     // 0=none, 1=PSH, 2=PSL
+    var float sigEntry      = na
+    var float sigSL         = na
+    var float sigTP         = na
+
+    ph = ta.pivothigh(high, pivotLen, pivotLen)
+    pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+    if not na(ph)
+        lastHigh    := ph
+        bosFiredUp  := false
+
+    if not na(pl)
+        lastLow    := pl
+        bosFiredDn := false
+
+    sweepUp = not na(lastHigh) and high > lastHigh and close <= lastHigh
+    sweepDn = not na(lastLow)  and low  < lastLow  and close >= lastLow
+
+    if sweepUp
+        pendSwH     := lastHigh
+        pendSwHBar  := bar_index
+        waitBearBOS := true
+    if sweepDn
+        pendSwL     := lastLow
+        pendSwLBar  := bar_index
+        waitBullBOS := true
+
+    bullBOS = not na(lastHigh) and close > lastHigh and not bosFiredUp
+    bearBOS = not na(lastLow)  and close < lastLow  and not bosFiredDn
+
+    if bullBOS
+        bosFiredUp := true
+    if bearBOS
+        bosFiredDn := true
+
+    bullGap = high[2] < low[0]
+    bearGap = low[2]  > high[0]
+
+    protHighOK = waitBearBOS and bearBOS and (bar_index - pendSwHBar <= sweepWindow) and (not requireVolGap or bearGap)
+    protLowOK  = waitBullBOS and bullBOS and (bar_index - pendSwLBar <= sweepWindow) and (not requireVolGap or bullGap)
+
+    if protHighOK
+        lastSignalBar := bar_index
+        signalType    := 1
+        rng = pendSwH - low
+        sigEntry := low + 0.71 * rng
+        sigSL    := pendSwH
+        sigTP    := low
+        waitBearBOS := false
+
+    if protLowOK
+        lastSignalBar := bar_index
+        signalType    := 2
+        rng = high - pendSwL
+        sigEntry := high - 0.71 * rng
+        sigSL    := pendSwL
+        sigTP    := high
+        waitBullBOS := false
+
+    if waitBearBOS and (bar_index - pendSwHBar > sweepWindow)
+        waitBearBOS := false
+    if waitBullBOS and (bar_index - pendSwLBar > sweepWindow)
+        waitBullBOS := false
+
+    barsSince = na(lastSignalBar) ? -1 : bar_index - lastSignalBar
+    [signalType, sigEntry, sigSL, sigTP, barsSince, close]
+
+// ─── Per-symbol scan ─────────────────────────────────────────────────
+[t1, e1, sl1, tp1_, b1, px1] = request.security(sym1,  scanTF, calcSetup())
+[t2, e2, sl2, tp2_, b2, px2] = request.security(sym2,  scanTF, calcSetup())
+[t3, e3, sl3, tp3_, b3, px3] = request.security(sym3,  scanTF, calcSetup())
+[t4, e4, sl4, tp4_, b4, px4] = request.security(sym4,  scanTF, calcSetup())
+[t5, e5, sl5, tp5_, b5, px5] = request.security(sym5,  scanTF, calcSetup())
+[t6, e6, sl6, tp6_, b6, px6] = request.security(sym6,  scanTF, calcSetup())
+[t7, e7, sl7, tp7_, b7, px7] = request.security(sym7,  scanTF, calcSetup())
+[t8, e8, sl8, tp8_, b8, px8] = request.security(sym8,  scanTF, calcSetup())
+[t9, e9, sl9, tp9_, b9, px9] = request.security(sym9,  scanTF, calcSetup())
+[t10,e10,sl10,tp10_,b10,px10] = request.security(sym10, scanTF, calcSetup())
+[t11,e11,sl11,tp11_,b11,px11] = request.security(sym11, scanTF, calcSetup())
+[t12,e12,sl12,tp12_,b12,px12] = request.security(sym12, scanTF, calcSetup())
+[t13,e13,sl13,tp13_,b13,px13] = request.security(sym13, scanTF, calcSetup())
+[t14,e14,sl14,tp14_,b14,px14] = request.security(sym14, scanTF, calcSetup())
+[t15,e15,sl15,tp15_,b15,px15] = request.security(sym15, scanTF, calcSetup())
+[t16,e16,sl16,tp16_,b16,px16] = request.security(sym16, scanTF, calcSetup())
+
+// ─── Render table ────────────────────────────────────────────────────
+tblPosVal = tblPos == "top_right" ? position.top_right : tblPos == "top_left" ? position.top_left : tblPos == "bottom_right" ? position.bottom_right : tblPos == "bottom_left" ? position.bottom_left : position.middle_right
+
+tblSizeVal = tblTextSize == "tiny" ? size.tiny : tblTextSize == "small" ? size.small : tblTextSize == "normal" ? size.normal : size.large
+
+var table dash = table.new(tblPosVal, 7, 18, bgcolor=color.new(color.black, 80), border_color=color.gray, border_width=1, frame_color=color.gray, frame_width=1)
+
+f_row(row, sym, t, entry, sl, tp, bars, px) =>
+    showRow = t > 0 and (maxBarsAgo == 0 or bars <= maxBarsAgo)
+    sigText = t == 1 ? "PSH ↓ SHORT" : t == 2 ? "PSL ↑ LONG" : "—"
+    sigBg = t == 1 ? color.new(color.red, 70) : t == 2 ? color.new(color.green, 70) : color.new(color.gray, 90)
+    sigFg = t == 1 ? color.red : t == 2 ? color.lime : color.gray
+    // Trim symbol name to last part after ":"
+    symShort = str.contains(sym, ":") ? str.split(sym, ":").get(1) : sym
+    table.cell(dash, 0, row, symShort, text_color=color.white, bgcolor=sigBg, text_size=tblSizeVal)
+    table.cell(dash, 1, row, sigText, text_color=sigFg, bgcolor=sigBg, text_size=tblSizeVal)
+    table.cell(dash, 2, row, showRow ? str.tostring(px, format.mintick) : "—", text_color=color.silver, bgcolor=sigBg, text_size=tblSizeVal)
+    table.cell(dash, 3, row, showRow ? str.tostring(entry, format.mintick) : "—", text_color=color.lime, bgcolor=sigBg, text_size=tblSizeVal)
+    table.cell(dash, 4, row, showRow ? str.tostring(sl, format.mintick) : "—", text_color=color.red, bgcolor=sigBg, text_size=tblSizeVal)
+    table.cell(dash, 5, row, showRow ? str.tostring(tp, format.mintick) : "—", text_color=color.aqua, bgcolor=sigBg, text_size=tblSizeVal)
+    table.cell(dash, 6, row, showRow ? str.tostring(bars) + "b ago" : "—", text_color=color.gray, bgcolor=sigBg, text_size=tblSizeVal)
+
+if barstate.islast
+    // Header row
+    table.cell(dash, 0, 0, "Symbol",  text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+    table.cell(dash, 1, 0, "Setup",   text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+    table.cell(dash, 2, 0, "Price",   text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+    table.cell(dash, 3, 0, "Entry",   text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+    table.cell(dash, 4, 0, "SL",      text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+    table.cell(dash, 5, 0, "TP",      text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+    table.cell(dash, 6, 0, "Age",     text_color=color.yellow, bgcolor=color.new(color.gray, 30), text_size=tblSizeVal)
+
+    f_row(1,  sym1,  t1,  e1,  sl1,  tp1_,  b1,  px1)
+    f_row(2,  sym2,  t2,  e2,  sl2,  tp2_,  b2,  px2)
+    f_row(3,  sym3,  t3,  e3,  sl3,  tp3_,  b3,  px3)
+    f_row(4,  sym4,  t4,  e4,  sl4,  tp4_,  b4,  px4)
+    f_row(5,  sym5,  t5,  e5,  sl5,  tp5_,  b5,  px5)
+    f_row(6,  sym6,  t6,  e6,  sl6,  tp6_,  b6,  px6)
+    f_row(7,  sym7,  t7,  e7,  sl7,  tp7_,  b7,  px7)
+    f_row(8,  sym8,  t8,  e8,  sl8,  tp8_,  b8,  px8)
+    f_row(9,  sym9,  t9,  e9,  sl9,  tp9_,  b9,  px9)
+    f_row(10, sym10, t10, e10, sl10, tp10_, b10, px10)
+    f_row(11, sym11, t11, e11, sl11, tp11_, b11, px11)
+    f_row(12, sym12, t12, e12, sl12, tp12_, b12, px12)
+    f_row(13, sym13, t13, e13, sl13, tp13_, b13, px13)
+    f_row(14, sym14, t14, e14, sl14, tp14_, b14, px14)
+    f_row(15, sym15, t15, e15, sl15, tp15_, b15, px15)
+    f_row(16, sym16, t16, e16, sl16, tp16_, b16, px16)

@@ -1,0 +1,205 @@
+//@version=6
+// =====================================================================
+// FMES Backtester (M6) — Strategy version of FMES Trade Setup Detector
+//
+// Same detection logic as the indicator, but uses strategy.entry / .exit
+// to place simulated trades. Produces TV Strategy Tester output:
+//   - Net profit / Net profit %
+//   - Win rate, Profit factor
+//   - Max drawdown
+//   - Sharpe / Sortino ratios
+//   - Trade-by-trade list with entry / exit prices
+//   - Equity curve (Strategy Tester → Performance Summary tab)
+//
+// Position sizing: risk-based — each trade risks `Risk per trade %` of
+// account equity. Position size auto-adjusts based on stop distance.
+//
+// Recommended use:
+//   1. Add to USDJPY / EURUSD / GBPUSD H4 chart
+//   2. Open Strategy Tester (bottom panel) to see stats
+//   3. Tune `Pivot lookback`, `Sweep window`, `Risk %` inputs
+//   4. Compare HWR on/off to validate the dual-limit edge
+// =====================================================================
+
+strategy("FMES Backtester",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     pyramiding=4,
+     commission_type=strategy.commission.percent,
+     commission_value=0.02,
+     slippage=2,
+     max_lines_count=500, max_boxes_count=500, max_labels_count=500,
+     process_orders_on_close=true)
+
+// ─── Inputs ──────────────────────────────────────────────────────────
+grpRisk = "Risk Management"
+riskPct      = input.float(1.0, "Risk per trade (% of equity)", 0.1, 5.0, step=0.1, group=grpRisk, tooltip="Position size auto-adjusts so SL = this % loss.")
+enableHWR    = input.bool(true,  "Enable HWR dual-limit (Fib + OB)", group=grpRisk)
+hwrTargetRR  = input.float(2.0,  "OB limit target R:R", 0.5, 5.0, step=0.5, group=grpRisk)
+
+grpCore = "FMES Rules"
+pivotLen      = input.int(5,  "Pivot lookback",                1, 50,  group=grpCore)
+sweepWindow   = input.int(20, "Max bars between sweep & BOS",  1, 100, group=grpCore)
+requireVolGap = input.bool(true, "Require volume gap on BOS",         group=grpCore)
+
+grpDate = "Backtest Window"
+useDateRange = input.bool(false, "Limit backtest to date range", group=grpDate)
+startDate    = input.time(timestamp("2023-01-01"), "Start", group=grpDate)
+endDate      = input.time(timestamp("2026-12-31"), "End",   group=grpDate)
+
+grpDisp = "Display"
+showZones = input.bool(true, "Show setup zones on chart", group=grpDisp)
+
+inRange = not useDateRange or (time >= startDate and time <= endDate)
+
+// ─── Pivots ──────────────────────────────────────────────────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+// ─── State ───────────────────────────────────────────────────────────
+var float lastHigh    = na
+var int   lastHighBar = na
+var bool  bosFiredUp  = false
+
+var float lastLow    = na
+var int   lastLowBar = na
+var bool  bosFiredDn = false
+
+var float pendSwH    = na
+var int   pendSwHBar = na
+var bool  waitBearBOS = false
+
+var float pendSwL    = na
+var int   pendSwLBar = na
+var bool  waitBullBOS = false
+
+var int setupCount = 0
+
+// ─── Pivot registration ──────────────────────────────────────────────
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - pivotLen
+    bosFiredUp  := false
+
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - pivotLen
+    bosFiredDn := false
+
+// ─── Sweep ───────────────────────────────────────────────────────────
+sweepUp = not na(lastHigh) and high > lastHigh and close <= lastHigh
+sweepDn = not na(lastLow)  and low  < lastLow  and close >= lastLow
+
+if sweepUp
+    pendSwH     := lastHigh
+    pendSwHBar  := bar_index
+    waitBearBOS := true
+
+if sweepDn
+    pendSwL     := lastLow
+    pendSwLBar  := bar_index
+    waitBullBOS := true
+
+// ─── BOS ─────────────────────────────────────────────────────────────
+bullBOS = not na(lastHigh) and close > lastHigh and not bosFiredUp
+bearBOS = not na(lastLow)  and close < lastLow  and not bosFiredDn
+
+if bullBOS
+    bosFiredUp := true
+if bearBOS
+    bosFiredDn := true
+
+// ─── Volume gap ──────────────────────────────────────────────────────
+bullGap = high[2] < low[0]
+bearGap = low[2]  > high[0]
+
+// ─── Protected confirmation ──────────────────────────────────────────
+protHighOK = waitBearBOS and bearBOS and (bar_index - pendSwHBar <= sweepWindow) and (not requireVolGap or bearGap)
+protLowOK  = waitBullBOS and bullBOS and (bar_index - pendSwLBar <= sweepWindow) and (not requireVolGap or bullGap)
+
+// ─── Trade execution on PSH/PSL ──────────────────────────────────────
+// Position sizing: qty as % of equity such that SL hit = exactly riskPct% loss
+//   qtyPct = (riskPct / sl_distance_as_pct_of_entry) * 100
+//   This may exceed 100% (uses leverage) for tight stops.
+
+if protHighOK and inRange
+    setupCount := setupCount + 1
+    swhPrice = pendSwH
+    swLow    = low
+    rng      = swhPrice - swLow
+    entryPx  = swLow + 0.71 * rng
+    slPx     = swhPrice
+    tpPx     = swLow
+
+    slDistPct = math.abs(entryPx - slPx) / entryPx * 100
+    qtyPct    = slDistPct > 0 ? (riskPct / slDistPct) * 100 : 0
+
+    fibId = "S_Fib_" + str.tostring(setupCount)
+    if qtyPct > 0
+        strategy.entry(fibId, strategy.short, qty=qtyPct, limit=entryPx, comment="PSH Fib")
+        strategy.exit("X_" + fibId, from_entry=fibId, limit=tpPx, stop=slPx)
+
+    if enableHWR
+        sweepBarAgo = bar_index - pendSwHBar
+        obEntryPx = math.max(open[sweepBarAgo], close[sweepBarAgo])
+        obSLDistPct = math.abs(obEntryPx - slPx) / obEntryPx * 100
+        obQtyPct = obSLDistPct > 0 ? (riskPct / obSLDistPct) * 100 : 0
+        obTPPx = obEntryPx - math.abs(slPx - obEntryPx) * hwrTargetRR
+
+        obId = "S_OB_" + str.tostring(setupCount)
+        if obQtyPct > 0
+            strategy.entry(obId, strategy.short, qty=obQtyPct, limit=obEntryPx, comment="PSH OB")
+            strategy.exit("X_" + obId, from_entry=obId, limit=obTPPx, stop=slPx)
+
+    if showZones
+        rightX = bar_index + 50
+        line.new(bar_index, entryPx, rightX, entryPx, color=color.new(color.green, 30), style=line.style_dotted, width=1)
+        line.new(bar_index, slPx,    rightX, slPx,    color=color.new(color.red,   30), style=line.style_dotted, width=1)
+        line.new(bar_index, tpPx,    rightX, tpPx,    color=color.new(color.aqua,  30), style=line.style_dotted, width=1)
+
+    waitBearBOS := false
+
+if protLowOK and inRange
+    setupCount := setupCount + 1
+    swlPrice = pendSwL
+    swHigh   = high
+    rng      = swHigh - swlPrice
+    entryPx  = swHigh - 0.71 * rng
+    slPx     = swlPrice
+    tpPx     = swHigh
+
+    slDistPct = math.abs(entryPx - slPx) / entryPx * 100
+    qtyPct    = slDistPct > 0 ? (riskPct / slDistPct) * 100 : 0
+
+    fibId = "L_Fib_" + str.tostring(setupCount)
+    if qtyPct > 0
+        strategy.entry(fibId, strategy.long, qty=qtyPct, limit=entryPx, comment="PSL Fib")
+        strategy.exit("X_" + fibId, from_entry=fibId, limit=tpPx, stop=slPx)
+
+    if enableHWR
+        sweepBarAgo = bar_index - pendSwLBar
+        obEntryPx = math.min(open[sweepBarAgo], close[sweepBarAgo])
+        obSLDistPct = math.abs(obEntryPx - slPx) / obEntryPx * 100
+        obQtyPct = obSLDistPct > 0 ? (riskPct / obSLDistPct) * 100 : 0
+        obTPPx = obEntryPx + math.abs(obEntryPx - slPx) * hwrTargetRR
+
+        obId = "L_OB_" + str.tostring(setupCount)
+        if obQtyPct > 0
+            strategy.entry(obId, strategy.long, qty=obQtyPct, limit=obEntryPx, comment="PSL OB")
+            strategy.exit("X_" + obId, from_entry=obId, limit=obTPPx, stop=slPx)
+
+    if showZones
+        rightX = bar_index + 50
+        line.new(bar_index, entryPx, rightX, entryPx, color=color.new(color.green, 30), style=line.style_dotted, width=1)
+        line.new(bar_index, slPx,    rightX, slPx,    color=color.new(color.red,   30), style=line.style_dotted, width=1)
+        line.new(bar_index, tpPx,    rightX, tpPx,    color=color.new(color.aqua,  30), style=line.style_dotted, width=1)
+
+    waitBullBOS := false
+
+// ─── Stale sweep cleanup ─────────────────────────────────────────────
+if waitBearBOS and (bar_index - pendSwHBar > sweepWindow)
+    waitBearBOS := false
+if waitBullBOS and (bar_index - pendSwLBar > sweepWindow)
+    waitBullBOS := false
